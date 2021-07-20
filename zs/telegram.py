@@ -7,10 +7,17 @@ from functools import lru_cache
 from urllib.parse import parse_qsl, urlencode, urlparse
 
 import socks
+import datetime
+import time
+from zs.rss.config import RSSConfigManager
+from zs.rss.models import WechatArticle
+import requests
+import telethon
 from telethon import sync       # noqa
 from telethon.sessions import StringSession
 from telethon import TelegramClient as TelethonClient
 from telethon.tl.types import Photo, MessageEntityTextUrl
+from telethon.tl.types import PeerUser, PeerChat, PeerChannel
 
 from .consts import CONFIG_DIR, DATA_DIR
 
@@ -21,8 +28,7 @@ DEFAULT_CONFIG_FILE = os.path.join(CONFIG_DIR, 'telegram.json')
 WX_ARTICLE_PREFIX = '💬👤'
 WX_LINK_PREFIX = '🔗'
 WX_CHANNEL_PREFIX_PATTERN = re.compile(
-    r'(?:^微信)|'
-    r'(?:^tele_wechat_bot$)'
+    r'(?:^chat)'
 )
 WX_IMAGE_AUTHOR_PAT = re.compile(r'^(?P<name>.+):\nsent a (?:picture|sticker)\.$')
 WX_GENERAL_AUTHOR_PAT = re.compile(r'^(?P<name>.+):[\n ]+')
@@ -70,6 +76,10 @@ class TelegramConfigManager():
     @session.setter
     def session(self, value):
         self.data['session'] = value
+
+    @property
+    def sync(self):
+        return self.data.get('sync')
 
     @property
     def proxy(self):
@@ -169,7 +179,9 @@ class Message():
     @staticmethod
     def get_message_type(message):
         chat_name = Message.get_chat_name(message)
+        #LOGGER.info(f"chat_name: {chat_name}")
         if WX_CHANNEL_PREFIX_PATTERN.match(chat_name):
+            #LOGGER.info('call get_wx_message_type')
             return Message.get_wx_message_type(message)
 
         if isinstance(message.photo, Photo) and message.photo.sizes and \
@@ -287,6 +299,7 @@ class Message():
     @classmethod
     def parse(cls, message, msg_type=None, config=None, wx_msg_index=None):
         msg_type = msg_type or cls.get_message_type(message) or MessageType.OTHER
+        #LOGGER.info(f"parse msg_type: {msg_type}")
         if msg_type in cls.WX_MSG_TYPES:
             return cls.parse_wx_message(message, msg_type, config, wx_msg_index)
 
@@ -314,7 +327,7 @@ class Message():
                     }
                 ]
 
-        if message.from_id:
+        if message.from_id and hasattr(message.client.get_entity(message.from_id), 'username'):
             user = message.client.get_entity(message.from_id).username
         else:
             user = chat_name
@@ -362,11 +375,26 @@ class TelegramClient():
                 config_manager.session = client.session.save()
                 config_manager.save()
 
+        config_rss = RSSConfigManager()
+        self.webhooks = config_rss.huginn_webhooks
+        if not self.webhooks:
+            LOGGER.error(f"`huginn_webhooks` is not found in config file {config.config_file}");
+            return -1
+
+        if config_manager.sync:
+            LOGGER.info('sync start')
         # sync 模式下这里要加一个 start()，去掉的话会触发 ConnectionError 异常
-        self.client = TelethonClient(StringSession(config_manager.session),
-                                     config_manager.api_id,
-                                     config_manager.api_hash,
-                                     proxy=proxy).start()
+            self.client = TelethonClient(StringSession(config_manager.session),
+                                         config_manager.api_id,
+                                         config_manager.api_hash,
+                                         proxy=proxy).start()
+        else:
+            LOGGER.info('async')
+            self.client = TelethonClient(StringSession(config_manager.session),
+                                         config_manager.api_id,
+                                         config_manager.api_hash,
+                                         proxy=proxy)
+            #time.sleep(2)
         self.config_manager = config_manager
 
     @staticmethod
@@ -436,20 +464,25 @@ class TelegramClient():
                     LOGGER.info("processed %d messages and got %d valid messages",
                                 cnt, len(results))
 
+                #LOGGER.info(message)
                 cnt += 1
                 if isinstance(message.raw_text, str) and \
                    any(pat.findall(message.raw_text) for pat in self.IGNORED_MSG_PATTERNS):
+                    #LOGGER.info("not str or ignored")
                     continue
 
                 offset_id = message.id
                 msg = Message.parse(message, config=self.config_manager)
                 msg_timestamp = message.date
                 if not msg.content:
+                    #LOGGER.info("not msg.content")
                     continue
 
                 if start and msg.timestamp < start:
+                    #LOGGER.info(f"msg.timestamp: {msg.timestamp}, {start}")
                     break
 
+                #LOGGER.info(f"msg_type: {msg_type}, {msg.type}")
                 if not msg_type or msg.type == MessageType.from_str(msg_type):
                     results.append(msg)
                     if msg.type in Message.IMG_MSG_TYPES:
@@ -486,3 +519,47 @@ class TelegramClient():
 
         message.origin.download_media(photo)
         LOGGER.info("download image file: %s", photo)
+
+    async def my_event_handler(self, event):
+        #print(event.raw_text)
+        #print(event.message)
+        #print(event)
+        msg = Message.parse(event.message, config=self.config_manager)
+        if not msg.content:
+            return
+        msg_type='wx_article'
+        if not msg_type or msg.type == MessageType.from_str(msg_type):
+            if msg.type in Message.IMG_MSG_TYPES:
+                self.download_photo(msg)
+            title = msg.content['title']
+            url = msg.content['url']
+            description = msg.content['desc']
+            published_date = msg.timestamp
+            name = msg.user
+            article, created = WechatArticle.get_or_create(
+                name=name, title=title, description=description, url=url, date=published_date
+            )
+            #print(f'article.to_dict: {article.to_dict()}')
+            webhook_url = self.webhooks.get(article.name) or self.webhooks.get('default')
+            if not webhook_url:
+                return -1
+            response = requests.post(webhook_url, json=article.to_dict())
+            if not response:
+                return -1
+            if response.status_code in (200, 201):
+                print(f"[{datetime.datetime.now()}] sent article successfully - " 
+                      f"name: {article.name}; title: {article.title}")
+            else:
+                print(f"[{datetime.datetime.now()}] failed to send article:"
+                      f" {article.name}; title: {article.title}")
+
+    def start_loop(self, chat_id):
+        #print(f'=== start_loop: {chat_id}')
+        self.client.add_event_handler(self.my_event_handler, telethon.events.NewMessage(chats=[PeerChat(chat_id=chat_id)]))
+        
+        time.sleep(1)
+        self.client.start()
+        time.sleep(1)
+        #for dialog in self.client.iter_dialogs(): 
+        #    print(f'dialog: {dialog}')
+        self.client.run_until_disconnected()

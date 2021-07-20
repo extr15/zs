@@ -159,6 +159,7 @@ def send_wx_articles(name, limit, send_all):
         if not webhook_url:
             continue
 
+        #print(f"config.proxy: {config.proxy}")
         if config.proxy:
             response = requests.post(webhook_url, json=article.to_dict(), proxies=config.proxy)
         else:
@@ -399,3 +400,10 @@ def send_articles(name, limit, dest_type, send_all):
             )
 
     click.secho(f"[{datetime.datetime.now()}] sent {sent_cnt} articles", fg='green')
+
+@main.command("start-loop")
+@click.option("-n", "--name", help="tg group name")
+def start_loop(name):
+    client = TelegramClient()
+    client.start_loop(name)
+
