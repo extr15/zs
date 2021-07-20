@@ -554,12 +554,13 @@ class TelegramClient():
                       f" {article.name}; title: {article.title}")
 
     def start_loop(self, chat_id):
-        #print(f'=== start_loop: {chat_id}')
+        chat_id = int(chat_id)
+        print(f'=== start_loop: {chat_id}')
         self.client.add_event_handler(self.my_event_handler, telethon.events.NewMessage(chats=[PeerChat(chat_id=chat_id)]))
         
-        time.sleep(1)
+        #time.sleep(1)
         self.client.start()
-        time.sleep(1)
+        #time.sleep(1)
         #for dialog in self.client.iter_dialogs(): 
         #    print(f'dialog: {dialog}')
         self.client.run_until_disconnected()
